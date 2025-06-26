@@ -1,9 +1,23 @@
 #include "libx11cocoainput.h"
+#include <locale.h>
+#include <stdlib.h>
+#include <string.h>
 
 void (*javaDone)();
 int *(*javaDraw)(int, int, int, short, int, char *, wchar_t *, int, int, int);
 XICCallback calet, start, done, draw;
 XICCallback s_start, s_done, s_draw;
+
+// X11 error handler
+int x11_error_code = 0;
+int x11_error_handler(Display *display, XErrorEvent *error) {
+    x11_error_code = error->error_code;
+    char error_text[256];
+    XGetErrorText(display, error->error_code, error_text, sizeof(error_text));
+    CIError("X11 Error: %s (code: %d, request: %d, minor: %d)", 
+            error_text, error->error_code, error->request_code, error->minor_code);
+    return 0;
+}
 
 void setCallback(int *(*c_draw)(int, int, int, short, int, char *, wchar_t *, int, int, int), void (*c_done)()) {
     javaDraw = c_draw;
@@ -15,6 +29,30 @@ int preeditCalet(XIC xic, XPointer clientData, XPointer data) {
 }
 int preeditStart(XIC xic, XPointer clientData, XPointer data) {
     CIDebug("Preedit start");
+    
+    // Try to set a default position at start
+    XVaNestedList attr;
+    XPoint place;
+    
+    // Get window geometry to position at bottom-left
+    Window root;
+    int x, y;
+    unsigned int width, height, border, depth;
+    Window focus_window;
+    int revert_to;
+    XGetInputFocus(XDisplayOfIM(XIMOfIC(xic)), &focus_window, &revert_to);
+    
+    if (XGetGeometry(XDisplayOfIM(XIMOfIC(xic)), focus_window, &root, &x, &y, &width, &height, &border, &depth)) {
+        // Position near bottom-left with some padding
+        place.x = 10;  // 10 pixels from left
+        place.y = height - 50;  // 50 pixels from bottom
+        CIDebug("Window geometry: %dx%d, setting initial spot to: %d,%d", width, height, place.x, place.y);
+        
+        attr = XVaCreateNestedList(0, XNSpotLocation, &place, NULL);
+        XSetICValues(xic, XNPreeditAttributes, attr, NULL);
+        XFree(attr);
+    }
+    
     return 0;
 }
 int preeditDone(XIC xic, XPointer clientData, XPointer data) {
@@ -79,6 +117,28 @@ int preeditDraw(XIC xic, XPointer clientData, XPointer structptr) {
     XPoint place;
     place.x = array[0];
     place.y = array[1];
+    CIDebug("JavaDraw returned position: x=%d, y=%d", place.x, place.y);
+    
+    // If Java returns the placeholder 600,600, use a better default
+    if (place.x == 600 && place.y == 600) {
+        CIDebug("Detected placeholder coordinates (600,600), using bottom-left position");
+        
+        // Get window geometry to position at bottom-left
+        Window root;
+        int x, y;
+        unsigned int width, height, border, depth;
+        Window focus_window;
+        int revert_to;
+        XGetInputFocus(XDisplayOfIM(XIMOfIC(xic)), &focus_window, &revert_to);
+        
+        if (XGetGeometry(XDisplayOfIM(XIMOfIC(xic)), focus_window, &root, &x, &y, &width, &height, &border, &depth)) {
+            // Position near bottom-left of window
+            place.x = 10;  // 10 pixels from left
+            place.y = height - 30;  // 30 pixels from bottom
+            CIDebug("Using window-relative position: x=%d, y=%d (window: %dx%d)", place.x, place.y, width, height);
+        }
+    }
+    
     attr = XVaCreateNestedList(0, XNSpotLocation, &place, NULL);
     XSetICValues(xic, XNPreeditAttributes, attr, NULL);
     XFree(attr);
@@ -176,9 +236,121 @@ void initialize(
         break;
     }
     CIDebug("XIC mem address:%p", x11c->ic);
-    xim = XIMOfIC(ic);
-    CIDebug("XIM mem address:%p", xim);
+    
+    // Get the display from the IC first
+    Display *display = XDisplayOfIM(XIMOfIC(ic));
+    
+    // Install error handler to catch X11 errors
+    XErrorHandler old_handler = XSetErrorHandler(x11_error_handler);
+    
+    // Check current locale and modifiers
+    char *current_locale = setlocale(LC_ALL, NULL);
+    CILog("Current locale before: %s", current_locale ? current_locale : "NULL");
+    
+    // Check XMODIFIERS
+    char *xmodifiers = XSetLocaleModifiers("");
+    CILog("X locale modifiers: %s", xmodifiers ? xmodifiers : "NULL");
+    
+    // Try to open a proper XIM instead of using GLFW's limited one
+    char *orig_locale = setlocale(LC_ALL, NULL);
+    if (!XSupportsLocale()) {
+        CIError("X does not support current locale");
+    }
+    setlocale(LC_ALL, "");  // Use environment locale
+    
+    // Try with explicit modifiers first
+    char *env_xmod = getenv("XMODIFIERS");
+    CILog("XMODIFIERS env: '%s'", env_xmod ? env_xmod : "not set");
+    
+    if (env_xmod && strlen(env_xmod) > 0) {
+        XSetLocaleModifiers(env_xmod);
+        xim = XOpenIM(display, NULL, NULL, NULL);
+        if (xim != NULL) {
+            CILog("Opened XIM with XMODIFIERS: %s", env_xmod);
+        }
+    }
+    
+    if (xim == NULL) {
+        // Try common IM modifiers
+        char *im_modifiers[] = {"@im=ibus", "@im=fcitx", "@im=fcitx5", "@im=scim", "@im=uim", NULL};
+        for (int i = 0; im_modifiers[i] != NULL; i++) {
+            CILog("Trying XSetLocaleModifiers: %s", im_modifiers[i]);
+            XSetLocaleModifiers(im_modifiers[i]);
+            xim = XOpenIM(display, NULL, NULL, NULL);
+            if (xim != NULL) {
+                CILog("Successfully opened XIM with modifiers: %s", im_modifiers[i]);
+                
+                // Query this XIM's supported styles
+                XIMStyles *test_styles = NULL;
+                XGetIMValues(xim, XNQueryInputStyle, &test_styles, NULL);
+                if (test_styles) {
+                    CILog("This XIM supports %d styles", (int)test_styles->count_styles);
+                    for (int j = 0; j < test_styles->count_styles; j++) {
+                        CILog("  Style %d: 0x%lx", j, (unsigned long)test_styles->supported_styles[j]);
+                    }
+                    XFree(test_styles);
+                }
+                break;
+            }
+        }
+    }
+    
+    if (xim == NULL) {
+        // Try with default modifiers
+        CILog("Falling back to default modifiers");
+        XSetLocaleModifiers("");
+        xim = XOpenIM(display, NULL, NULL, NULL);
+    }
+    
+    if (xim == NULL) {
+        CIError("Failed to open XIM, falling back to GLFW's XIM");
+        xim = XIMOfIC(ic);
+    } else {
+        CILog("Successfully opened our own XIM");
+        
+        // Get more info about the XIM
+        XIMStyles *xim_styles = NULL;
+        XGetIMValues(xim, 
+                     XNQueryInputStyle, &xim_styles,
+                     NULL);
+        
+        if (xim_styles) {
+            CILog("Direct XIM query shows %d styles", (int)xim_styles->count_styles);
+        }
+    }
+    
+    // Restore locale
+    if (orig_locale) {
+        setlocale(LC_ALL, orig_locale);
+    }
+    
+    CILog("XIM mem address:%p", xim);
+    
+    // Query supported input styles
+    XIMStyles *im_supported_styles = NULL;
+    char *failed_arg = XGetIMValues(xim, XNQueryInputStyle, &im_supported_styles, NULL);
+    if (failed_arg != NULL) {
+        CIError("Failed to query input styles: %s", failed_arg);
+    } else if (im_supported_styles == NULL) {
+        CIError("XGetIMValues succeeded but im_supported_styles is NULL");
+    } else {
+        CILog("XIM supports %d input styles:", (int)im_supported_styles->count_styles);
+        for (int i = 0; i < im_supported_styles->count_styles; i++) {
+            XIMStyle style = im_supported_styles->supported_styles[i];
+            CILog("  Style %d: 0x%lx (Preedit: 0x%lx, Status: 0x%lx)",
+                    i, (unsigned long)style, 
+                    (unsigned long)(style & 0x00FF), 
+                    (unsigned long)(style & 0xFF00));
+        }
+        XFree(im_supported_styles);
+    }
+    
     xwindow = xw;
+    
+    // Clear error code and sync to ensure we catch errors
+    x11_error_code = 0;
+    XSync(display, False);
+    
     inactiveic = XCreateIC(
         xim,
         XNClientWindow,
@@ -189,7 +361,23 @@ void initialize(
         XIMPreeditNone | XIMStatusNone,
         NULL
     );
-    CIDebug("Created inactiveic-> default");
+    
+    XSync(display, False);  // Force error handling
+    
+    if (inactiveic == NULL || x11_error_code != 0) {
+        CIError("Failed to create inactiveic (error code: %d)", x11_error_code);
+        XSetErrorHandler(old_handler);
+        return;
+    }
+    CILog("Created inactiveic-> default");
+    
+    // Clear error code before creating activeic
+    x11_error_code = 0;
+    XSync(display, False);
+    
+    CILog("Attempting to create activeic with style 0x402 (XIMPreeditCallbacks | XIMStatusNothing)");
+    
+    // First try without attributes to see if that's the issue
     activeic = XCreateIC(
         xim,
         XNClientWindow,
@@ -197,22 +385,98 @@ void initialize(
         XNFocusWindow,
         xwindow,
         XNInputStyle,
-        XIMPreeditCallbacks | XIMStatusNone,
-        // XIMPreeditNothing | XIMStatusNothing,
-        XNPreeditAttributes,
-        preeditCallbacksList(),
-        XNStatusAttributes,
-        statusCallbacksList(),
+        XIMPreeditCallbacks | XIMStatusNothing,  // 0x402 - supported by IBus
         NULL
     );
-    CIDebug("Created activeic");
+    
+    if (activeic != NULL) {
+        CILog("Created IC without attributes, now setting callbacks");
+        // Set the callbacks after creation
+        XVaNestedList preedit_attr = preeditCallbacksList();
+        XVaNestedList status_attr = statusCallbacksList();
+        XSetICValues(activeic,
+                     XNPreeditAttributes, preedit_attr,
+                     XNStatusAttributes, status_attr,
+                     NULL);
+        XFree(preedit_attr);
+        XFree(status_attr);
+    }
+    
+    XSync(display, False);  // Force error handling
+    
+    CILog("XCreateIC returned: %p, x11_error_code: %d", activeic, x11_error_code);
+    
+    if (activeic == NULL || x11_error_code != 0) {
+        CIError("Failed to create activeic with XIMPreeditCallbacks (error code: %d)", x11_error_code);
+        // Just use another instance with supported style
+        activeic = XCreateIC(
+            xim,
+            XNClientWindow,
+            (Window)xwindow,
+            XNFocusWindow,
+            (Window)xwindow,
+            XNInputStyle,
+            XIMPreeditNone | XIMStatusNone,
+            NULL
+        );
+        if (activeic == NULL) {
+            CIError("Failed to create fallback activeic");
+            return;
+        }
+        CILog("Created fallback activeic with XIMPreeditNone | XIMStatusNone");
+    } else {
+        // Verify the IC was actually created properly
+        unsigned long actual_style = 0;
+        XVaNestedList ic_values = XVaCreateNestedList(0, XNInputStyle, &actual_style, NULL);
+        char *failed = XGetICValues(activeic, XNInputStyle, &actual_style, NULL);
+        if (ic_values) XFree(ic_values);
+        
+        if (failed != NULL) {
+            CIError("Failed to get IC values: %s", failed);
+            // Don't destroy it - it might still work
+        } else {
+            CILog("Active IC created with style: 0x%lx (requested: 0x%lx)", 
+                  (unsigned long)actual_style, 
+                  (unsigned long)(XIMPreeditCallbacks | XIMStatusNothing));
+        }
+        
+        // Even if we can't verify the style, keep the IC if it was created
+        CILog("Keeping activeic even if style verification failed");
+    }
+    
+    // If activeic failed, create a duplicate of inactiveic
+    if (activeic == NULL) {
+        activeic = XCreateIC(
+            xim,
+            XNClientWindow,
+            (Window)xwindow,
+            XNFocusWindow,
+            (Window)xwindow,
+            XNInputStyle,
+            XIMPreeditNone | XIMStatusNone,
+            NULL
+        );
+        if (activeic == NULL) {
+            CIError("Failed to create any activeic");
+            XDestroyIC(inactiveic);
+            return;
+        }
+        CILog("Using duplicate IC for activeic");
+    }
+    
     XSetICFocus(inactiveic);
-    XUnsetICFocus(activeic);
-    CIDebug("Completed ic focus");
+    if (activeic != NULL && activeic != inactiveic) {
+        XUnsetICFocus(activeic);
+    }
+    CILog("Completed ic focus");
     XDestroyIC(x11c->ic);
     x11c->ic = inactiveic;
-    CIDebug("Destroyed glfw ic");
-    CIDebug("CocoaInput X11 initializer done!");
+    CILog("Destroyed glfw ic");
+    
+    // Restore original error handler
+    XSetErrorHandler(old_handler);
+    
+    CILog("CocoaInput X11 initializer done!");
 }
 
 void set_focus(int flag) {
